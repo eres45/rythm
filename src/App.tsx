@@ -3304,7 +3304,8 @@ function toPlaybackUrl(url: string): string {
     if (!parsed.hostname.endsWith('saavncdn.com')) {
       return url;
     }
-    return `/audio-proxy?url=${encodeURIComponent(url)}`;
+    const proxyBase = import.meta.env.DEV ? '/audio-proxy' : '/api/audio-proxy';
+    return `${proxyBase}?url=${encodeURIComponent(url)}`;
   } catch {
     return url;
   }
