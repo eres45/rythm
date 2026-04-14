@@ -60,3 +60,32 @@ create policy "Anyone can write test users"
   for insert
   to anon
   with check (true);
+
+create table if not exists public.test_user_states (
+  user_id uuid primary key references public.test_users(id) on delete cascade,
+  state jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.test_user_states enable row level security;
+drop policy if exists "Anyone can read test user states" on public.test_user_states;
+create policy "Anyone can read test user states"
+  on public.test_user_states
+  for select
+  to anon
+  using (true);
+
+drop policy if exists "Anyone can write test user states" on public.test_user_states;
+create policy "Anyone can write test user states"
+  on public.test_user_states
+  for insert
+  to anon
+  with check (true);
+
+drop policy if exists "Anyone can update test user states" on public.test_user_states;
+create policy "Anyone can update test user states"
+  on public.test_user_states
+  for update
+  to anon
+  using (true)
+  with check (true);

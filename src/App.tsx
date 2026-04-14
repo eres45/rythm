@@ -228,6 +228,8 @@ function App() {
     [searchResults],
   );
 
+  const cloudTableName = USE_TEST_AUTH ? 'test_user_states' : 'user_states';
+
   function readTestSession(): AuthSession | null {
     if (typeof window === 'undefined') {
       return null;
@@ -398,9 +400,6 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (USE_TEST_AUTH) {
-      return;
-    }
     if (!supabase || !session?.user?.id) {
       return;
     }
@@ -412,7 +411,7 @@ function App() {
     void (async () => {
       try {
         const { data, error: fetchError } = await supabase
-          .from('user_states')
+          .from(cloudTableName)
           .select('user_id,state,updated_at')
           .eq('user_id', session.user.id)
           .maybeSingle<CloudStateRow>();
@@ -510,9 +509,6 @@ function App() {
   ]);
 
   useEffect(() => {
-    if (USE_TEST_AUTH) {
-      return;
-    }
     if (!supabase || !session?.user?.id || isHydratingFromCloud || isApplyingCloudStateRef.current) {
       return;
     }
@@ -530,7 +526,7 @@ function App() {
     cloudSaveTimerRef.current = window.setTimeout(() => {
       void (async () => {
         const { error: upsertError } = await supabaseClient
-          .from('user_states')
+          .from(cloudTableName)
           .upsert(
             {
               user_id: session.user.id,
@@ -1683,11 +1679,6 @@ function App() {
               <h2 className="text-[30px] font-semibold text-white sm:text-[34px]">
               {authMode === 'signup' ? 'Create your account' : 'Welcome back'}
               </h2>
-              {USE_TEST_AUTH ? (
-                <span className="rounded-full bg-amber-500/20 px-3 py-1 text-[10px] text-amber-100">
-                  Test auth
-                </span>
-              ) : null}
             </div>
             <p className="mt-2 text-sm text-[#9ea2a8]">
               {authMode === 'signup'
