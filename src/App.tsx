@@ -1,5 +1,7 @@
 import { ChevronDown, Download, FolderPlus, Heart, Home, ImagePlus, ListMusic, ListPlus, Maximize2, Mic2, Minimize2, Pause, Pencil, Play, Search, Shuffle, SkipBack, SkipForward, SlidersHorizontal, Trash2, UserRound, Volume2, VolumeX, X } from 'lucide-react';
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import type { Session } from '@supabase/supabase-js';
+import { isSupabaseConfigured, supabase } from './lib/supabase';
 
 type Song = {
   id: string;
@@ -37,6 +39,11 @@ type PersistedPlayerState = {
   queuedTrackIds: string[];
 };
 type StoredPlayerState = Partial<Omit<PersistedPlayerState, 'version'>> & { version?: number };
+type CloudStateRow = {
+  user_id: string;
+  state: StoredPlayerState;
+  updated_at?: string;
+};
 type Playlist = {
   id: string;
   name: string;
@@ -130,6 +137,15 @@ function App() {
   const [isShuffle, setIsShuffle] = useState(false);
   const [isExpandedPlayer, setIsExpandedPlayer] = useState(false);
   const [repeatMode] = useState<'off' | 'all' | 'one'>('all');
+  const [session, setSession] = useState<Session | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [isHydratingFromCloud, setIsHydratingFromCloud] = useState(false);
+  const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authError, setAuthError] = useState('');
+  const [cloudSyncStatus, setCloudSyncStatus] = useState('');
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const probeAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -148,6 +164,8 @@ function App() {
   const hasRestoredTrackRef = useRef(false);
   const playlistCoverInputRef = useRef<HTMLInputElement | null>(null);
   const editorCoverInputRef = useRef<HTMLInputElement | null>(null);
+  const cloudSaveTimerRef = useRef<number | null>(null);
+  const isApplyingCloudStateRef = useRef(false);
   const rafRef = useRef<number | null>(null);
   const vizBarsRef = useRef<number[]>(Array.from({ length: VIS_BAR_COUNT }, () => 18));
   const [vizBars, setVizBars] = useState<number[]>(
@@ -203,6 +221,71 @@ function App() {
     [searchResults],
   );
 
+  function applyStoredState(parsed: StoredPlayerState) {
+    setVolume(clamp01(Number(parsed.volume ?? 0.8)));
+    setIsMuted(Boolean(parsed.isMuted));
+    setIsShuffle(Boolean(parsed.isShuffle));
+    setLikedTrackIds(new Set((parsed.likedTrackIds || []).filter(Boolean)));
+    setLikedSongStore(
+      Array.isArray(parsed.likedSongs)
+        ? (parsed.likedSongs || []).filter((song): song is Song => Boolean(song?.id))
+        : [],
+    );
+    setPlaylists(
+      Array.isArray(parsed.playlists)
+        ? parsed.playlists
+            .filter((playlist): playlist is Playlist => Boolean(playlist?.id && playlist?.name))
+            .map((playlist) => ({
+              id: playlist.id,
+              name: playlist.name,
+              cover: typeof playlist.cover === 'string' ? playlist.cover : undefined,
+              description: typeof playlist.description === 'string' ? playlist.description : '',
+              createdAt: Number(playlist.createdAt || Date.now()),
+              songs: Array.isArray(playlist.songs)
+                ? playlist.songs.filter((song): song is Song => Boolean(song?.id))
+                : [],
+            }))
+        : [],
+    );
+    setSelectedPlaylistId(typeof parsed.selectedPlaylistId === 'string' ? parsed.selectedPlaylistId : null);
+    setQueuedTrackIds((parsed.queuedTrackIds || []).filter(Boolean));
+
+    if (parsed.currentTrack?.id) {
+      setCurrentTrack(parsed.currentTrack);
+      setDuration(parsed.currentTrack.durationSec || 0);
+      setCurrentTime(Math.max(0, Number(parsed.currentTimeSec || 0)));
+      hasRestoredTrackRef.current = true;
+      pendingRestoreRef.current = parsed;
+    }
+  }
+
+  const persistedPayload = useMemo<PersistedPlayerState>(() => ({
+    version: 3,
+    currentTrack,
+    currentTimeSec: Math.max(0, Math.floor(currentTime)),
+    wasPlaying: isPlaying,
+    volume: clamp01(volume),
+    isMuted,
+    isShuffle,
+    likedTrackIds: [...likedTrackIds],
+    likedSongs: likedSongs.filter((song) => likedTrackIds.has(song.id)),
+    playlists,
+    selectedPlaylistId,
+    queuedTrackIds,
+  }), [
+    currentTrack,
+    Math.floor(currentTime),
+    isPlaying,
+    volume,
+    isMuted,
+    isShuffle,
+    likedTrackIds,
+    likedSongs,
+    playlists,
+    selectedPlaylistId,
+    queuedTrackIds,
+  ]);
+
   useEffect(() => {
     if (typeof window === 'undefined') {
       return;
@@ -217,46 +300,83 @@ function App() {
       if (!parsed || (typeof parsed.version === 'number' && ![1, 2, 3].includes(parsed.version))) {
         return;
       }
-
-      setVolume(clamp01(Number(parsed.volume ?? 0.8)));
-      setIsMuted(Boolean(parsed.isMuted));
-      setIsShuffle(Boolean(parsed.isShuffle));
-      setLikedTrackIds(new Set((parsed.likedTrackIds || []).filter(Boolean)));
-      setLikedSongStore(
-        Array.isArray(parsed.likedSongs)
-          ? (parsed.likedSongs || []).filter((song): song is Song => Boolean(song?.id))
-          : [],
-      );
-      setPlaylists(
-        Array.isArray(parsed.playlists)
-          ? parsed.playlists
-              .filter((playlist): playlist is Playlist => Boolean(playlist?.id && playlist?.name))
-              .map((playlist) => ({
-                id: playlist.id,
-                name: playlist.name,
-                cover: typeof playlist.cover === 'string' ? playlist.cover : undefined,
-                description: typeof playlist.description === 'string' ? playlist.description : '',
-                createdAt: Number(playlist.createdAt || Date.now()),
-                songs: Array.isArray(playlist.songs)
-                  ? playlist.songs.filter((song): song is Song => Boolean(song?.id))
-                  : [],
-              }))
-          : [],
-      );
-      setSelectedPlaylistId(typeof parsed.selectedPlaylistId === 'string' ? parsed.selectedPlaylistId : null);
-      setQueuedTrackIds((parsed.queuedTrackIds || []).filter(Boolean));
-
-      if (parsed.currentTrack?.id) {
-        setCurrentTrack(parsed.currentTrack);
-        setDuration(parsed.currentTrack.durationSec || 0);
-        setCurrentTime(Math.max(0, Number(parsed.currentTimeSec || 0)));
-        hasRestoredTrackRef.current = true;
-        pendingRestoreRef.current = parsed;
-      }
+      applyStoredState(parsed);
     } catch {
       // Ignore corrupted local storage state.
     }
   }, []);
+
+  useEffect(() => {
+    if (!supabase) {
+      setAuthReady(true);
+      return;
+    }
+
+    let mounted = true;
+    void supabase.auth.getSession().then(({ data }) => {
+      if (!mounted) {
+        return;
+      }
+      setSession(data.session);
+      setAuthReady(true);
+    });
+
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+    });
+
+    return () => {
+      mounted = false;
+      authListener.subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!supabase || !session?.user?.id) {
+      return;
+    }
+
+    let cancelled = false;
+    setIsHydratingFromCloud(true);
+    setCloudSyncStatus('Syncing your library...');
+
+    void (async () => {
+      try {
+        const { data, error: fetchError } = await supabase
+          .from('user_states')
+          .select('user_id,state,updated_at')
+          .eq('user_id', session.user.id)
+          .maybeSingle<CloudStateRow>();
+
+        if (fetchError) {
+          throw fetchError;
+        }
+        if (cancelled) {
+          return;
+        }
+
+        if (data?.state && typeof data.state === 'object') {
+          isApplyingCloudStateRef.current = true;
+          applyStoredState(data.state);
+          isApplyingCloudStateRef.current = false;
+          setCloudSyncStatus('Synced from cloud');
+        } else {
+          setCloudSyncStatus('No cloud backup found yet');
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Cloud sync failed';
+        setCloudSyncStatus(`Cloud sync failed: ${msg}`);
+      } finally {
+        if (!cancelled) {
+          setIsHydratingFromCloud(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.user?.id]);
 
   useEffect(() => {
     void loadMusicHome();
@@ -310,39 +430,59 @@ function App() {
     if (typeof window === 'undefined') {
       return;
     }
-    const payload: PersistedPlayerState = {
-      version: 3,
-      currentTrack,
-      currentTimeSec: Math.max(0, Math.floor(currentTime)),
-      wasPlaying: isPlaying,
-      volume: clamp01(volume),
-      isMuted,
-      isShuffle,
-      likedTrackIds: [...likedTrackIds],
-      likedSongs: likedSongs.filter((song) => likedTrackIds.has(song.id)),
-      playlists,
-      selectedPlaylistId,
-      queuedTrackIds,
-    };
 
     try {
-      window.localStorage.setItem(PLAYER_STATE_STORAGE_KEY, JSON.stringify(payload));
+      window.localStorage.setItem(PLAYER_STATE_STORAGE_KEY, JSON.stringify(persistedPayload));
     } catch {
       // Ignore quota/storage failures.
     }
   }, [
-    currentTrack,
-    Math.floor(currentTime),
-    isPlaying,
-    volume,
-    isMuted,
-    isShuffle,
-    likedTrackIds,
-    likedSongs,
-    playlists,
-    selectedPlaylistId,
-    queuedTrackIds,
+    persistedPayload,
   ]);
+
+  useEffect(() => {
+    if (!supabase || !session?.user?.id || isHydratingFromCloud || isApplyingCloudStateRef.current) {
+      return;
+    }
+    const supabaseClient = supabase;
+
+    if (cloudSaveTimerRef.current !== null) {
+      window.clearTimeout(cloudSaveTimerRef.current);
+    }
+
+    const cloudPayload: PersistedPlayerState = {
+      ...persistedPayload,
+      currentTimeSec: Math.max(0, Math.floor(persistedPayload.currentTimeSec / 5) * 5),
+    };
+
+    cloudSaveTimerRef.current = window.setTimeout(() => {
+      void (async () => {
+        const { error: upsertError } = await supabaseClient
+          .from('user_states')
+          .upsert(
+            {
+              user_id: session.user.id,
+              state: cloudPayload,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'user_id' },
+          );
+
+        if (upsertError) {
+          setCloudSyncStatus(`Cloud save failed: ${upsertError.message}`);
+          return;
+        }
+        setCloudSyncStatus('Cloud backup saved');
+      })();
+    }, 1600);
+
+    return () => {
+      if (cloudSaveTimerRef.current !== null) {
+        window.clearTimeout(cloudSaveTimerRef.current);
+        cloudSaveTimerRef.current = null;
+      }
+    };
+  }, [persistedPayload, session?.user?.id, isHydratingFromCloud]);
   useEffect(() => {
     if (!isExpandedPlayer) {
       return;
@@ -1301,6 +1441,53 @@ function App() {
     }
   }
 
+  async function handleAuthSubmit() {
+    if (!supabase) {
+      setAuthError('Supabase is not configured');
+      return;
+    }
+    setAuthSubmitting(true);
+    setAuthError('');
+    try {
+      if (authMode === 'signup') {
+        const { error: signUpError } = await supabase.auth.signUp({
+          email: email.trim(),
+          password,
+        });
+        if (signUpError) {
+          throw signUpError;
+        }
+        setCloudSyncStatus('Sign-up successful. Check your email if confirmation is enabled.');
+      } else {
+        const { error: signInError } = await supabase.auth.signInWithPassword({
+          email: email.trim(),
+          password,
+        });
+        if (signInError) {
+          throw signInError;
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Authentication failed';
+      setAuthError(msg);
+    } finally {
+      setAuthSubmitting(false);
+    }
+  }
+
+  async function handleSignOut() {
+    if (!supabase) {
+      return;
+    }
+    const { error: signOutError } = await supabase.auth.signOut();
+    if (signOutError) {
+      setCloudSyncStatus(`Sign out failed: ${signOutError.message}`);
+      return;
+    }
+    setCloudSyncStatus('Signed out');
+    setSession(null);
+  }
+
   const progress = duration ? Math.min(100, (currentTime / duration) * 100) : 0;
   const topPickDisplay: Song[] = loading
     ? Array.from({ length: 6 }, (_, idx) => ({
@@ -1310,6 +1497,114 @@ function App() {
         cover: '',
       }))
     : topPicks;
+
+  if (!isSupabaseConfigured) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-[#020304] p-6 text-[#f4f4f5]">
+        <div className="glass w-full max-w-[560px] rounded-2xl p-6">
+          <h1 className="text-xl font-semibold">Supabase Setup Required</h1>
+          <p className="mt-2 text-sm text-[#9ea2a8]">
+            Add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` (or the `NEXT_PUBLIC_` equivalents) in your `.env`.
+          </p>
+          <p className="mt-2 text-xs text-[#7d8087]">
+            Then run the SQL in `supabase/schema.sql` inside your Supabase SQL editor.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!authReady) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-[#020304] text-[#f4f4f5]">
+        <p className="text-sm text-[#a6a9b0]">Connecting to Supabase...</p>
+      </div>
+    );
+  }
+
+  if (!session) {
+    return (
+      <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-[#020304] p-5 text-[#f4f4f5] sm:p-8">
+        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_12%_0%,rgba(255,255,255,0.10)_0%,rgba(255,255,255,0)_40%)]" />
+        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_92%_90%,rgba(255,145,84,0.14)_0%,rgba(255,145,84,0)_45%)]" />
+
+        <div className="relative grid w-full max-w-[980px] overflow-hidden rounded-[26px] border border-white/10 bg-[#0b0f16]/85 shadow-[0_24px_80px_rgba(0,0,0,0.52)] md:grid-cols-[1.05fr_0.95fr]">
+          <section className="hidden min-h-[560px] flex-col justify-between border-r border-white/8 bg-[linear-gradient(150deg,#111a29_0%,#0b1019_45%,#120d0b_100%)] p-9 md:flex">
+            <div>
+              <p className="text-[10px] tracking-[0.24em] text-white/55">RYTHM CLOUD</p>
+              <h1 className="mt-4 text-[42px] font-semibold leading-[1.05] text-white">Your music, synced everywhere.</h1>
+              <p className="mt-4 max-w-[420px] text-sm text-[#adb3bd]">
+                Secure sign in with Supabase keeps playlists, likes, and playback progress linked to your account.
+              </p>
+            </div>
+            <div className="space-y-2 text-xs text-[#9da3ad]">
+              <p>1. Authenticated access only</p>
+              <p>2. Per-user encrypted session</p>
+              <p>3. Automatic cloud backup of your library</p>
+            </div>
+          </section>
+
+          <section className="p-6 sm:p-8">
+            <h2 className="text-[30px] font-semibold text-white sm:text-[34px]">
+              {authMode === 'signup' ? 'Create your account' : 'Welcome back'}
+            </h2>
+            <p className="mt-2 text-sm text-[#9ea2a8]">
+              {authMode === 'signup' ? 'Start your synced music library.' : 'Sign in to continue your session.'}
+            </p>
+
+            <div className="mt-6 flex rounded-full bg-white/6 p-1 text-xs">
+              <button
+                type="button"
+                onClick={() => setAuthMode('signin')}
+                className={`flex-1 rounded-full px-3 py-2 ${authMode === 'signin' ? 'bg-white/14 text-white' : 'text-[#c9ccd2]'}`}
+              >
+                Sign In
+              </button>
+              <button
+                type="button"
+                onClick={() => setAuthMode('signup')}
+                className={`flex-1 rounded-full px-3 py-2 ${authMode === 'signup' ? 'bg-white/14 text-white' : 'text-[#c9ccd2]'}`}
+              >
+                Sign Up
+              </button>
+            </div>
+
+            <div className="mt-5 space-y-2.5">
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="Email address"
+                className="w-full rounded-xl border border-white/8 bg-white/8 px-3 py-2.5 text-sm text-white outline-none placeholder:text-[#8c9097] focus:border-white/20"
+              />
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Password"
+                className="w-full rounded-xl border border-white/8 bg-white/8 px-3 py-2.5 text-sm text-white outline-none placeholder:text-[#8c9097] focus:border-white/20"
+              />
+            </div>
+
+            {authError ? <p className="mt-3 text-xs text-[#ff9d9d]">{authError}</p> : null}
+
+            <button
+              type="button"
+              onClick={() => void handleAuthSubmit()}
+              disabled={authSubmitting || !email.trim() || !password}
+              className="mt-5 w-full rounded-xl bg-white/14 px-4 py-2.5 text-sm text-white hover:bg-white/20 disabled:opacity-50"
+            >
+              {authSubmitting ? 'Please wait...' : authMode === 'signup' ? 'Create Account' : 'Sign In'}
+            </button>
+
+            <p className="mt-3 text-[11px] text-[#8f939a]">
+              {cloudSyncStatus || 'Your playlists and progress will sync after sign in.'}
+            </p>
+          </section>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="relative min-h-screen bg-[#020304] text-[#f4f4f5]">
@@ -1528,6 +1823,17 @@ function App() {
         </aside>
 
         <main className="flex-1 overflow-hidden px-4 pt-5 lg:px-4 lg:pr-6">
+          <div className="mx-auto mb-3 flex w-full max-w-[1180px] items-center justify-end gap-2">
+            {cloudSyncStatus ? <span className="text-[11px] text-[#8f939a]">{cloudSyncStatus}</span> : null}
+            {isHydratingFromCloud ? <span className="text-[11px] text-[#8f939a]">Syncing...</span> : null}
+            <button
+              type="button"
+              onClick={() => void handleSignOut()}
+              className="rounded-full bg-white/10 px-3 py-1.5 text-[11px] text-white hover:bg-white/15"
+            >
+              Sign Out
+            </button>
+          </div>
           {view === 'home' ? (
             <div className="mx-auto max-w-[1130px] space-y-5">
               <section>
