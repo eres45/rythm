@@ -32,11 +32,16 @@ module.exports = async function handler(req, res) {
       return;
     }
 
+    const referer = String(req.headers.referer || 'https://www.jiosaavn.com/');
+    const origin = String(req.headers.origin || 'https://www.jiosaavn.com');
+
     const upstream = await fetch(parsed.toString(), {
       redirect: 'follow',
       headers: {
         Accept: String(req.headers.accept || '*/*'),
         'User-Agent': 'Mozilla/5.0',
+        Referer: referer,
+        Origin: origin,
         ...(req.headers.range ? { Range: String(req.headers.range) } : {}),
       },
     });
@@ -50,6 +55,7 @@ module.exports = async function handler(req, res) {
       }
     }
     res.setHeader('access-control-allow-origin', '*');
+    res.setHeader('access-control-expose-headers', 'Content-Range,Accept-Ranges,Content-Length');
 
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '');

@@ -1153,6 +1153,23 @@ function App() {
           return resolved;
         } catch (err) {
           lastError = err instanceof Error ? err.message : String(err);
+          // Fallback: try direct URL if proxy fails.
+          if (playbackUrl !== candidateUrl) {
+            try {
+              await probeAudioSource(probe, candidateUrl, 12000);
+              const resolved: ResolvedStream = {
+                url: candidateUrl,
+                directUrl: candidateUrl,
+                viaProxy: false,
+                durationSec: Number(song.durationSec || 0),
+                base: saavnBase,
+              };
+              streamCacheRef.current.set(song.id, resolved);
+              return resolved;
+            } catch (directErr) {
+              lastError = directErr instanceof Error ? directErr.message : String(directErr);
+            }
+          }
           if (lastError.includes('timeout')) {
             return {
               url: playbackUrl,
