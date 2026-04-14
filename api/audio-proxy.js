@@ -1,5 +1,3 @@
-const { Readable } = require('node:stream');
-
 const ALLOWED_AUDIO_HOSTS = ['saavncdn.com'];
 
 module.exports = async function handler(req, res) {
@@ -50,12 +48,8 @@ module.exports = async function handler(req, res) {
     }
     res.setHeader('access-control-allow-origin', '*');
 
-    if (!upstream.body) {
-      res.end();
-      return;
-    }
-
-    Readable.fromWeb(upstream.body).pipe(res);
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+    res.end(buffer);
   } catch (err) {
     res.statusCode = 502;
     res.end('Audio proxy failed');
