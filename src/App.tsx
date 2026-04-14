@@ -1,6 +1,5 @@
 import { ChevronDown, Download, FolderPlus, Heart, Home, ImagePlus, ListMusic, ListPlus, Maximize2, Mic2, Minimize2, Pause, Pencil, Play, Search, Shuffle, SkipBack, SkipForward, SlidersHorizontal, Trash2, UserRound, Volume2, VolumeX, X } from 'lucide-react';
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
-import type { Session } from '@supabase/supabase-js';
 import { isSupabaseConfigured, supabase } from './lib/supabase';
 
 type Song = {
@@ -43,6 +42,12 @@ type CloudStateRow = {
   user_id: string;
   state: StoredPlayerState;
   updated_at?: string;
+};
+type AuthSession = {
+  user: {
+    id: string;
+    email: string;
+  };
 };
 type Playlist = {
   id: string;
@@ -92,6 +97,8 @@ const saavnBase = 'https://saavn.sumit.co/api';
 const DEBUG_AUDIO = true;
 const VIS_BAR_COUNT = 46;
 const PLAYER_STATE_STORAGE_KEY = 'rythm.player.state.v1';
+const TEST_AUTH_STORAGE_KEY = 'rythm.test.auth.session.v1';
+const USE_TEST_AUTH = (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_USE_TEST_AUTH !== 'false';
 const LIKED_LIBRARY_COVER = 'https://picsum.photos/seed/lib1/60/60';
 const PLAYLIST_LIBRARY_COVER = 'https://picsum.photos/seed/lib2/60/60';
 
@@ -137,7 +144,7 @@ function App() {
   const [isShuffle, setIsShuffle] = useState(false);
   const [isExpandedPlayer, setIsExpandedPlayer] = useState(false);
   const [repeatMode] = useState<'off' | 'all' | 'one'>('all');
-  const [session, setSession] = useState<Session | null>(null);
+  const [session, setSession] = useState<AuthSession | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [isHydratingFromCloud, setIsHydratingFromCloud] = useState(false);
   const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin');
@@ -220,6 +227,50 @@ function App() {
     () => dedupeByLabel(searchResults.map((s) => s.artist || 'Unknown Artist')),
     [searchResults],
   );
+
+  function readTestSession(): AuthSession | null {
+    if (typeof window === 'undefined') {
+      return null;
+    }
+    try {
+      const raw = window.localStorage.getItem(TEST_AUTH_STORAGE_KEY);
+      if (!raw) {
+        return null;
+      }
+      const parsed = JSON.parse(raw) as AuthSession;
+      if (!parsed?.user?.id || !parsed.user.email) {
+        return null;
+      }
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  function writeTestSession(next: AuthSession | null) {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    try {
+      if (!next) {
+        window.localStorage.removeItem(TEST_AUTH_STORAGE_KEY);
+        return;
+      }
+      window.localStorage.setItem(TEST_AUTH_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // Ignore storage failures.
+    }
+  }
+
+  async function hashPassword(value: string): Promise<string> {
+    if (typeof window === 'undefined' || !window.crypto?.subtle) {
+      return value;
+    }
+    const data = new TextEncoder().encode(value);
+    const digest = await window.crypto.subtle.digest('SHA-256', data);
+    const bytes = Array.from(new Uint8Array(digest));
+    return bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
 
   function applyStoredState(parsed: StoredPlayerState) {
     setVolume(clamp01(Number(parsed.volume ?? 0.8)));
@@ -307,6 +358,13 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (USE_TEST_AUTH) {
+      const stored = readTestSession();
+      setSession(stored);
+      setAuthReady(true);
+      return;
+    }
+
     if (!supabase) {
       setAuthReady(true);
       return;
@@ -317,12 +375,20 @@ function App() {
       if (!mounted) {
         return;
       }
-      setSession(data.session);
+      if (data.session?.user?.id && data.session.user.email) {
+        setSession({ user: { id: data.session.user.id, email: data.session.user.email } });
+      } else {
+        setSession(null);
+      }
       setAuthReady(true);
     });
 
     const { data: authListener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
-      setSession(nextSession);
+      if (nextSession?.user?.id && nextSession.user.email) {
+        setSession({ user: { id: nextSession.user.id, email: nextSession.user.email } });
+      } else {
+        setSession(null);
+      }
     });
 
     return () => {
@@ -332,6 +398,9 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (USE_TEST_AUTH) {
+      return;
+    }
     if (!supabase || !session?.user?.id) {
       return;
     }
@@ -441,6 +510,9 @@ function App() {
   ]);
 
   useEffect(() => {
+    if (USE_TEST_AUTH) {
+      return;
+    }
     if (!supabase || !session?.user?.id || isHydratingFromCloud || isApplyingCloudStateRef.current) {
       return;
     }
@@ -1442,13 +1514,69 @@ function App() {
   }
 
   async function handleAuthSubmit() {
-    if (!supabase) {
-      setAuthError('Supabase is not configured');
-      return;
-    }
     setAuthSubmitting(true);
     setAuthError('');
     try {
+      if (USE_TEST_AUTH) {
+        const emailValue = email.trim().toLowerCase();
+        if (!emailValue || !password) {
+          throw new Error('Email and password required');
+        }
+        const passwordHash = await hashPassword(password);
+        if (!supabase) {
+          throw new Error('Supabase is not configured');
+        }
+
+        if (authMode === 'signup') {
+          const { data: existing, error: existingError } = await supabase
+            .from('test_users')
+            .select('id,email')
+            .eq('email', emailValue)
+            .maybeSingle();
+          if (existingError) {
+            throw existingError;
+          }
+          if (existing) {
+            throw new Error('Email already exists');
+          }
+
+          const { data: created, error: insertError } = await supabase
+            .from('test_users')
+            .insert({ email: emailValue, password_hash: passwordHash })
+            .select('id,email')
+            .single();
+          if (insertError) {
+            throw insertError;
+          }
+          const nextSession: AuthSession = { user: { id: created.id, email: created.email } };
+          setSession(nextSession);
+          writeTestSession(nextSession);
+          setCloudSyncStatus('Test account created');
+          return;
+        }
+
+        const { data: userRow, error: userError } = await supabase
+          .from('test_users')
+          .select('id,email,password_hash')
+          .eq('email', emailValue)
+          .maybeSingle();
+        if (userError) {
+          throw userError;
+        }
+        if (!userRow || userRow.password_hash !== passwordHash) {
+          throw new Error('Invalid email or password');
+        }
+        const nextSession: AuthSession = { user: { id: userRow.id, email: userRow.email } };
+        setSession(nextSession);
+        writeTestSession(nextSession);
+        setCloudSyncStatus('Signed in (test mode)');
+        return;
+      }
+
+      if (!supabase) {
+        setAuthError('Supabase is not configured');
+        return;
+      }
       if (authMode === 'signup') {
         const { error: signUpError } = await supabase.auth.signUp({
           email: email.trim(),
@@ -1476,6 +1604,12 @@ function App() {
   }
 
   async function handleSignOut() {
+    if (USE_TEST_AUTH) {
+      writeTestSession(null);
+      setSession(null);
+      setCloudSyncStatus('Signed out');
+      return;
+    }
     if (!supabase) {
       return;
     }
@@ -1545,11 +1679,20 @@ function App() {
           </section>
 
           <section className="p-6 sm:p-8">
-            <h2 className="text-[30px] font-semibold text-white sm:text-[34px]">
+            <div className="flex items-center justify-between">
+              <h2 className="text-[30px] font-semibold text-white sm:text-[34px]">
               {authMode === 'signup' ? 'Create your account' : 'Welcome back'}
-            </h2>
+              </h2>
+              {USE_TEST_AUTH ? (
+                <span className="rounded-full bg-amber-500/20 px-3 py-1 text-[10px] text-amber-100">
+                  Test auth
+                </span>
+              ) : null}
+            </div>
             <p className="mt-2 text-sm text-[#9ea2a8]">
-              {authMode === 'signup' ? 'Start your synced music library.' : 'Sign in to continue your session.'}
+              {authMode === 'signup'
+                ? 'Create an account in seconds.'
+                : 'Sign in to continue your session.'}
             </p>
 
             <div className="mt-6 flex rounded-full bg-white/6 p-1 text-xs">
